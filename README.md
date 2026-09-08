@@ -24,23 +24,29 @@ ChatGPT 计划的 codex 用户在高峰期经常遇到：
 ```
 codex CLI ──► 127.0.0.1:8317 (本代理) ──► https://chatgpt.com/backend-api/codex
                     │
-                    ├─ 容量错误(重试) ──► 3s,6s,12s,24s,30s... 退避重试, 最多 20 次
-                    └─ 正常响应 ───────► 原样透传(保持 SSE 流式)
+                    ├─ 流首容量错误 ──► 代理静默重试(3s,6s,12s...最多20次), codex 无感
+                    ├─ 输出中途容量错误 ► 吞掉错误+断连, codex 以断线重试机制自动重发
+                    └─ 正常响应 ──────► 逐事件透传(保持 SSE 流式)
 ```
 
 ### 处理的错误形态
 
-实测后端返回「容量满」有两种形态，均已处理：
+实测后端返回「容量满」有三种形态，均已处理：
 
 | 形态 | 表现 | 处理 |
 |---|---|---|
 | HTTP 429/529 | 错误码在响应状态行 | 直接重试，遵守 `Retry-After` |
-| **HTTP 200 + SSE 流内错误事件**（更常见） | `response.created` → `response.in_progress` → `error`(code: `server_is_overloaded`) → `response.failed` | 按住流头部不放，识别到可重试错误就丢弃该流并重新发起请求 |
+| **HTTP 200 + 流首错误事件**（最常见） | `response.created` → `response.in_progress` → `error`(code: `server_is_overloaded`) | 代理扣留流头部，识别到可重试错误就丢弃该流并重新发起请求，codex 完全无感 |
+| **HTTP 200 + 输出中途错误事件** | 模型已输出部分推理/文本后 `error` 过载 | 代理吞掉错误事件并断开连接，伪装成网络中断；codex 对断线会自动重试，新请求再次经过代理 |
 
-关键机制：代理会**扣留流的头部元数据事件**（`response.created` / `response.in_progress`）不转发给 codex，直到看到二者之一——
+代理对 SSE 流做**逐事件转发**，分两个阶段：
+
+**阶段一（扣留头部）**：结构事件（`response.created`、`response.in_progress`、`response.output_item.added`、`response.content_part.added`、`response.reasoning_summary_part.added`）没有任何用户可见输出，全部扣留不转发，直到看到二者之一——
 
 - **可重试错误事件** → 这条流从未到达 codex，可以完全无感地重新请求；
-- **第一个内容事件**（模型开始输出）→ 立即放行全部缓冲并切换纯透传，不影响流式体验。
+- **第一个真实增量输出**（delta 类事件 / 条目 done）→ 放行全部缓冲并进入阶段二。
+
+**阶段二（逐事件透传）**：内容事件逐个转发，保持流式体验；若中途出现可重试的过载错误，代理会**吞掉错误事件并断开与 codex 的连接**——codex 把它当作网络中断处理（codex 对流内容量错误是直接放弃的，但对断线会自动重试），重发的新请求又回到代理，形成第二层防护。
 
 可重试错误码：`server_is_overloaded`、`usage_limit_reached`、`model_at_capacity`、`service_unavailable`、`at capacity` 等。参数错误、配额耗尽、认证失败等不可重试错误原样透传给 codex。
 
@@ -54,7 +60,7 @@ codex CLI ──► 127.0.0.1:8317 (本代理) ──► https://chatgpt.com/bac
 ## 快速开始
 
 ```bash
-git clone https://github.com/<你的用户名>/codex-capacity-retry.git
+git clone https://github.com/Jason213/codex-capacity-retry.git
 cd codex-capacity-retry
 ./install.sh
 ```
@@ -98,13 +104,12 @@ tail -5 ~/.codex/capacity-retry-proxy/proxy.log
 
 实测在 ChatGPT 登录态（OAuth）下该环境变量不生效（只对 API Key 认证有效），且新版 codex 禁止覆盖内置 `openai` provider 的定义，所以采用新增自定义 provider + `requires_openai_auth = true` 的方式，这是目前对 ChatGPT 计划用户唯一可行的透明转发方案。
 
-### 重试策略
+### 重试策略（两层防护）
 
-- 触发：见上表两种形态；
-- 退避：3s → 6s → 12s → 24s → 之后每次 30s（429 带 `Retry-After` 时优先遵守，上限 60s）；
-- 上限：最多 20 次尝试（纯等待约 8 分钟；算上每次尝试本身的耗时，最坏约 10~15 分钟）；
-- 耗尽后：把错误原样转发给 codex 正常报错，不会挂死；
-- **限制**：如果模型已经输出了一部分内容后才出现过载错误，代理不会重试（重试会导致内容重复），只能透传——此时由 codex 自己的内部重试兜底。这是极少数仍可能看到报错的场景。
+- **第一层（代理内部）**：流首过载错误，代理静默重试——退避 3s → 6s → 12s → 24s → 之后每次 30s（429 带 `Retry-After` 时优先遵守，上限 60s），最多 20 次尝试（纯等待约 8 分钟）。期间 codex 只表现为这次请求等得久，无任何报错；
+- **第二层（codex 重试）**：输出中途过载，代理吞掉错误并断连，codex 以断线重试机制自动重发；重发请求如再遇流首过载，又回到第一层；
+- 重试预算耗尽后：把错误原样转发给 codex 正常报错，不会挂死；
+- **限制**：中途过载时模型已输出的部分内容会被丢弃重来（codex 断线重试的天然行为），界面上偶尔会看到输出重新开始，属正常现象。
 
 ### 调整参数
 
@@ -131,10 +136,10 @@ tail -f ~/.codex/capacity-retry-proxy/proxy.log
 | 日志 | 含义 |
 |---|---|
 | `POST ... -> 200` | 请求正常透传 |
-| `-> 200 (in-stream server_is_overloaded), will retry` + `retrying, attempt N` | 捕获容量错误，正在静默重试（正常工作） |
+| `-> 200 (in-stream server_is_overloaded), will retry` + `retrying, attempt N` | 流首容量错误被拦截，正在静默重试（第一层，正常工作） |
+| `.. mid-stream capacity error swallowed, dropping connection so codex retries` | 输出中途过载，已吞掉错误并断连，等待 codex 自动重发（第二层，正常工作） |
 | `.. terminal(ok): response.completed` | 请求成功完成 |
-| `!! post-content terminal error` | 输出开始后才出错，已透传（无法安全重试） |
-| `!! retry budget exhausted` | 重试约 8 分钟仍失败，错误已透传给 codex |
+| `!! capacity error but retry budget exhausted` | 重试约 8 分钟仍失败，错误已透传给 codex |
 | `stream read error` / `upstream error` | 网络层问题（如本机代理未运行） |
 
 常见问题：
@@ -166,7 +171,7 @@ PORT=8317 node ~/.codex/capacity-retry-proxy/proxy.mjs &
 
 A tiny local transparent retry proxy for the OpenAI Codex CLI that automatically retries the `Selected model is at capacity. Please try a different model.` error (backend `server_is_overloaded` / `usage_limit_reached`).
 
-It works by defining a custom `model_provider` in `~/.codex/config.toml` pointing at a local Node.js HTTP proxy (`127.0.0.1:8317`). The proxy holds back SSE stream headers (`response.created` / `response.in_progress`), so when a capacity error event arrives before any model output, the whole request can be retried transparently with exponential backoff (3s→30s, up to 20 attempts). Once real content starts, everything is piped through untouched. It also retries plain HTTP 429/529 responses. Your ChatGPT credentials never leave your machine — the proxy only relays to `https://chatgpt.com`.
+It works by defining a custom `model_provider` in `~/.codex/config.toml` pointing at a local Node.js HTTP proxy (`127.0.0.1:8317`). The proxy relays SSE responses event by event: structural head events (`response.created` / `response.in_progress` / `response.output_item.added` / ...) are held back, so when a capacity error arrives before any model output the whole request is retried transparently with exponential backoff (3s→30s, up to 20 attempts). If an overload error strikes *after* output has started, the proxy swallows the error event and drops the connection, which codex treats as a network failure and retries on its own — the fresh request comes back through the proxy. Plain HTTP 429/529 responses are retried too. Your ChatGPT credentials never leave your machine — the proxy only relays to `https://chatgpt.com`.
 
 Requires macOS + Node.js ≥ 18 + Codex CLI signed in with a ChatGPT account. Install with `./install.sh`, toggle with `cx_proxy` / `cx_office`, uninstall with `./uninstall.sh`. See the Chinese sections above for details.
 
