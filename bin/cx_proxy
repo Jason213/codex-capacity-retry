@@ -1,0 +1,51 @@
+#!/bin/bash
+# cx_proxy - 切换 Codex 走本地容量重试代理（自动重试 "Selected model is at capacity"），
+# 并确保代理服务已启用、在运行
+set -euo pipefail
+CONFIG="$HOME/.codex/config.toml"
+PLIST="$HOME/Library/LaunchAgents/com.codex.capacity-retry-proxy.plist"
+SERVICE="gui/$(id -u)/com.codex.capacity-retry-proxy"
+PORT="$(cat "$HOME/.codex/capacity-retry-proxy/port" 2>/dev/null || echo 8317)"
+
+python3 - "$CONFIG" "$PORT" <<'EOF'
+import sys, pathlib, re
+config_path, port = sys.argv[1], sys.argv[2]
+p = pathlib.Path(config_path)
+s = p.read_text()
+# 移除已有的（含注释的）顶层 model_provider 设置，再重新置顶写入
+s = re.sub(r'(?m)^\s*#?\s*model_provider\s*=\s*"openai-proxy"\s*\n', '', s)
+s = f'model_provider = "openai-proxy"\n\n' + s.lstrip('\n')
+
+# 确保代理 provider 定义存在（自愈：被误删时自动补回）
+if '[model_providers.openai-proxy]' not in s:
+    s = s.rstrip('\n') + f'''
+
+[model_providers.openai-proxy]
+name = "OpenAI (local capacity-retry proxy)"
+base_url = "http://127.0.0.1:{port}/backend-api/codex"
+wire_api = "responses"
+requires_openai_auth = true
+'''
+p.write_text(s)
+EOF
+
+# 恢复代理服务：enable 解除 cx_office 的停用，bootstrap (重新)加载并启动。
+# 已在运行时 bootstrap 会报错，属正常情况，先 bootout 再 bootstrap 保证幂等。
+# SKIP_LAUNCHCTL=1 时跳过（供 install.sh 的 SKIP_LAUNCHD 沙箱安装使用）。
+if [ "${SKIP_LAUNCHCTL:-0}" != "1" ]; then
+  if [ -f "$PLIST" ]; then
+    launchctl enable "$SERVICE" 2>/dev/null || true
+    launchctl bootout "$SERVICE" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+  else
+    echo "⚠️  缺少 ${PLIST}，无法启动代理服务，请重新运行 install.sh"
+  fi
+fi
+
+# 代理服务仍未响应时给出提示
+if ! curl -s --max-time 2 -o /dev/null "http://127.0.0.1:${PORT}/"; then
+  echo "⚠️  本地代理 127.0.0.1:${PORT} 无响应，请检查日志："
+  echo "   tail -20 ~/.codex/capacity-retry-proxy/proxy.log"
+fi
+
+echo "✅ Codex 已切换为本地重试代理模式（openai-proxy @ 127.0.0.1:${PORT}）"
