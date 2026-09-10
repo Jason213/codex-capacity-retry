@@ -15,6 +15,9 @@
 //     repeated transparently.
 
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const PORT = Number(process.env.PORT || 8317);
@@ -34,6 +37,88 @@ const HOP_HEADERS = new Set([
 const RETRYABLE_MARK = /server_is_overloaded|usage_limit_reached|model_at_capacity|at capacity|service_unavailable|servers are currently overloaded/i;
 
 const log = (...a) => console.log(`[${new Date().toLocaleString("sv")}]`, ...a);
+
+// Per-request tag to tell parallel codex sessions apart in the log.
+//
+// Codex sends prompt_cache_key (defaults to its session_id, see codex-rs
+// client.rs) in the POST body — the wire carries NO session name. The
+// /rename name is only stored locally (never sent upstream), so resolve it
+// here:
+//   1. ~/.codex/session_index.jsonl  (id -> thread_name, append-only, last
+//      entry wins; re-read when the file's mtime changes so a /rename shows
+//      up on the next request)
+//   2. first user message in the request body (what codex's own auto-title
+//      is derived from)
+//   3. session id prefix
+// Requests without a usable body (GET /models etc.) fall back to #n.
+const SESSION_INDEX = path.join(
+  process.env.CODEX_HOME || path.join(os.homedir(), ".codex"),
+  "session_index.jsonl",
+);
+let indexMtime = 0;
+let indexNames = new Map(); // session id -> thread_name
+function loadSessionIndex() {
+  let st;
+  try { st = fs.statSync(SESSION_INDEX); } catch { return; }
+  if (st.mtimeMs === indexMtime) return;
+  const names = new Map();
+  try {
+    for (const line of fs.readFileSync(SESSION_INDEX, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const e = JSON.parse(line);
+        if (e.id && typeof e.thread_name === "string" && e.thread_name.trim()) {
+          names.set(e.id, e.thread_name.trim());
+        }
+      } catch { /* skip malformed line */ }
+    }
+  } catch { return; }
+  indexMtime = st.mtimeMs;
+  indexNames = names;
+}
+
+function firstUserText(j) {
+  if (!Array.isArray(j.input)) return "";
+  for (const item of j.input) {
+    if (item?.type !== "message" || item.role !== "user" || !Array.isArray(item.content)) continue;
+    for (const c of item.content) {
+      const t = c?.text ?? c?.input_text;
+      if (typeof t === "string" && t.trim()) return t;
+    }
+  }
+  return "";
+}
+
+let reqCounter = 0;
+const tagCache = new Map(); // cache key -> { tag, ts }
+const TAG_TTL_MS = 5000; // re-resolve occasionally so /rename takes effect
+function requestTag(req, body) {
+  let key = "";
+  let parsed = null;
+  if (body) {
+    try {
+      parsed = JSON.parse(body.toString("utf8"));
+      const v = parsed.prompt_cache_key || parsed.session_id || parsed.thread_id
+        || parsed.client_metadata?.session_id;
+      if (typeof v === "string" && v) key = v;
+    } catch { /* non-JSON body */ }
+  }
+  if (!key) return `#${++reqCounter}`;
+
+  const hit = tagCache.get(key);
+  if (hit && Date.now() - hit.ts < TAG_TTL_MS) return hit.tag;
+
+  // Internal sub-agent sessions use "{source}:{parent_thread_id}" as the
+  // cache key; resolve the parent id so they get the parent's name.
+  const id = key.includes(":") ? key.split(":").pop() : key;
+  loadSessionIndex();
+  let name = indexNames.get(id) || "";
+  if (!name && parsed) name = firstUserText(parsed);
+  name = name.replace(/\s+/g, " ").trim().slice(0, 24);
+  const tag = name ? `${name}#${id.slice(0, 8)}` : id.slice(0, 8);
+  tagCache.set(key, { tag, ts: Date.now() });
+  return tag;
+}
 
 function shouldRetryStatus(status) {
   return status === 429 || status === 529;
@@ -101,11 +186,12 @@ function classifyEvent(block) {
 //  fresh request comes back through this proxy.
 //
 // Returns "RETRY" (nothing sent, safe to repeat the request) or "DONE".
-async function relayWithSniff(req, res, upstream, canRetry) {
+async function relayWithSniff(req, res, upstream, canRetry, tag) {
   const headers = collectHeaders(upstream);
   const contentType = upstream.headers.get("content-type") || "";
   const sniff = req.method === "POST" || contentType.includes("event-stream");
 
+  const rlog = (...a) => log(`[${tag}]`, ...a);
   const reader = upstream.body.getReader();
   let pending = Buffer.alloc(0); // received bytes, events before `cursor` are handled
   let cursor = 0;
@@ -115,7 +201,7 @@ async function relayWithSniff(req, res, upstream, canRetry) {
     if (sentHead) return;
     sentHead = true;
     res.writeHead(upstream.status, headers);
-    log(`${req.method} ${req.url} -> ${upstream.status}`);
+    rlog(`${req.method} ${req.url} -> ${upstream.status}`);
   };
 
   try {
@@ -155,11 +241,11 @@ async function relayWithSniff(req, res, upstream, canRetry) {
 
           if (kind === "retry" && canRetry) {
             try { await reader.cancel(); } catch { /* ignore */ }
-            log(`${req.method} ${req.url} -> 200 (in-stream ${block.match(/"code":"(\w+)"/)?.[1] ?? "error"}), will retry`);
+            rlog(`${req.method} ${req.url} -> 200 (in-stream ${block.match(/"code":"(\w+)"/)?.[1] ?? "error"}), will retry`);
             return "RETRY";
           }
           if (kind === "retry") {
-            log(`${req.method} ${req.url} !! capacity error but retry budget exhausted, forwarding to codex`);
+            rlog(`${req.method} ${req.url} !! capacity error but retry budget exhausted, forwarding to codex`);
           }
           // First real output (or terminal error / budget exhausted):
           // flush everything held so far INCLUDING this event, then stream.
@@ -173,13 +259,13 @@ async function relayWithSniff(req, res, upstream, canRetry) {
         // ---- Phase 2: streaming, event by event ----
         const name = block.match(/^event:\s*(\S+)/)?.[1] ?? "";
         if ((name === "error" || name === "response.failed") && RETRYABLE_MARK.test(block)) {
-          log(`${req.method} ${req.url} .. mid-stream capacity error swallowed, dropping connection so codex retries | ${(block.split("data: ")[1] ?? "").slice(0, 160).replace(/\n/g, " ")}`);
+          rlog(`${req.method} ${req.url} .. mid-stream capacity error swallowed, dropping connection so codex retries | ${(block.split("data: ")[1] ?? "").slice(0, 160).replace(/\n/g, " ")}`);
           try { await reader.cancel(); } catch { /* ignore */ }
           res.destroy();
           return "DONE";
         }
         if (name === "error" || name === "response.failed" || name === "response.completed" || name === "response.incomplete") {
-          log(`${req.method} ${req.url} .. terminal${name.includes("completed") && !name.includes("incomplete") ? "(ok)" : "(error)"}: event: ${name} | ${(block.split("data: ")[1] ?? "").slice(0, 200).replace(/\n/g, " ")}`);
+          rlog(`${req.method} ${req.url} .. terminal${name.includes("completed") && !name.includes("incomplete") ? "(ok)" : "(error)"}: event: ${name} | ${(block.split("data: ")[1] ?? "").slice(0, 200).replace(/\n/g, " ")}`);
         }
         res.write(blockBytes);
       }
@@ -203,10 +289,10 @@ async function relayWithSniff(req, res, upstream, canRetry) {
       const text = pending.toString("utf8");
       if (RETRYABLE_MARK.test(text) && /"type":"(error|response.failed)"/.test(text)) {
         if (canRetry) {
-          log(`${req.method} ${req.url} -> 200 (capacity error body), will retry`);
+          rlog(`${req.method} ${req.url} -> 200 (capacity error body), will retry`);
           return "RETRY";
         }
-        log(`${req.method} ${req.url} !! capacity error body but retry budget exhausted, forwarding to codex`);
+        rlog(`${req.method} ${req.url} !! capacity error body but retry budget exhausted, forwarding to codex`);
       }
       sendHead();
       res.write(pending.subarray(cursor));
@@ -214,7 +300,7 @@ async function relayWithSniff(req, res, upstream, canRetry) {
     res.end();
     return "DONE";
   } catch (err) {
-    log(`stream read error on ${req.url}: ${err.message}`);
+    rlog(`stream read error on ${req.url}: ${err.message}`);
     if (!sentHead) {
       res.writeHead(502, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: `proxy stream error: ${err.message}` } }));
@@ -229,6 +315,8 @@ const server = http.createServer(async (req, res) => {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const body = chunks.length ? Buffer.concat(chunks) : undefined;
+  const tag = requestTag(req, body);
+  const rlog = (...a) => log(`[${tag}]`, ...a);
 
   let delay = BASE_DELAY_MS;
   for (let attempt = 1; ; attempt++) {
@@ -241,7 +329,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: { message: `proxy upstream error: ${err.message}` } }));
         return;
       }
-      log(`upstream error (${err.message}), retry ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`);
+      rlog(`upstream error (${err.message}), retry ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`);
       await sleep(delay);
       delay = Math.min(delay * 2, 30000);
       continue;
@@ -256,7 +344,7 @@ const server = http.createServer(async (req, res) => {
         const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
           ? Math.min(retryAfter * 1000, 60000)
           : delay;
-        log(`${upstream.status} on ${req.url}, retry ${attempt}/${MAX_ATTEMPTS - 1} in ${waitMs}ms`);
+        rlog(`${upstream.status} on ${req.url}, retry ${attempt}/${MAX_ATTEMPTS - 1} in ${waitMs}ms`);
         await sleep(waitMs);
         delay = Math.min(delay * 2, 30000);
         continue;
@@ -267,9 +355,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const result = await relayWithSniff(req, res, upstream, attempt < MAX_ATTEMPTS);
+    const result = await relayWithSniff(req, res, upstream, attempt < MAX_ATTEMPTS, tag);
     if (result === "RETRY" && attempt < MAX_ATTEMPTS) {
-      log(`retrying ${req.url}, attempt ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`);
+      rlog(`retrying ${req.url}, attempt ${attempt}/${MAX_ATTEMPTS - 1} in ${delay}ms`);
       await sleep(delay);
       delay = Math.min(delay * 2, 30000);
       continue;
