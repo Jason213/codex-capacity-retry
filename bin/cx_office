@@ -1,5 +1,6 @@
 #!/bin/bash
-# cx_office - 切换 Codex 为原生直连方式（不走本地重试代理），并停用本地代理服务
+# cx_office - 切换 Codex 为 ChatGPT 原生直连方式，并停用本地代理服务。
+# 保留 provider ID，只把同一个 provider 的 base_url 改回 ChatGPT。
 set -euo pipefail
 CONFIG="$HOME/.codex/config.toml"
 SERVICE="gui/$(id -u)/com.codex.capacity-retry-proxy"
@@ -8,9 +9,40 @@ python3 - "$CONFIG" <<'EOF'
 import sys, pathlib, re
 p = pathlib.Path(sys.argv[1])
 s = p.read_text()
-# 去掉顶层的 model_provider = "openai-proxy"（含被注释的旧设置），回到内置默认 provider
-s = re.sub(r'(?m)^\s*#?\s*model_provider\s*=\s*"openai-proxy"\s*\n', '', s)
-p.write_text(s.lstrip('\n'))
+provider_id = "openai-proxy"
+base_url = "https://chatgpt.com/backend-api/codex"
+
+# Keep the persisted provider identity stable so named and UUID resumes use the
+# same provider before and after switching modes.
+s = re.sub(r'(?m)^\s*#?\s*model_provider\s*=\s*"[^"\n]+"\s*\n', '', s)
+s = f'model_provider = "{provider_id}"\n\n' + s.lstrip('\n')
+
+section_re = re.compile(r'(?ms)^\[model_providers\.openai-proxy\]\n.*?(?=^\[|\Z)')
+match = section_re.search(s)
+if match:
+    section = match.group(0)
+    section = re.sub(r'(?m)^\s*base_url\s*=\s*"[^"\n]*"\s*\n',
+                     f'base_url = "{base_url}"\n', section, count=1)
+    if 'base_url =' not in section:
+        section = section.replace('[model_providers.openai-proxy]\n',
+                                  f'[model_providers.openai-proxy]\nbase_url = "{base_url}"\n', 1)
+    if re.search(r'(?m)^\s*supports_websockets\s*=', section):
+        section = re.sub(r'(?m)^\s*supports_websockets\s*=\s*[^\n]*\n',
+                         'supports_websockets = false\n', section, count=1)
+    else:
+        section = section.rstrip('\n') + '\nsupports_websockets = false\n'
+    s = s[:match.start()] + section + s[match.end():]
+else:
+    s = s.rstrip('\n') + f'''
+
+[model_providers.openai-proxy]
+name = "OpenAI (capacity-retry route)"
+base_url = "{base_url}"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+'''
+p.write_text(s)
 EOF
 
 # 停用本地重试代理的 launchd 服务：bootout 立即停止，disable 防止下次登录自启
@@ -20,5 +52,5 @@ if [ "${SKIP_LAUNCHCTL:-0}" != "1" ]; then
   launchctl disable "$SERVICE" 2>/dev/null || true
 fi
 
-echo "✅ Codex 已切换为原生直连（model_provider 使用内置默认）"
+echo "✅ Codex 已切换为 ChatGPT 原生直连（provider=openai-proxy，base_url=chatgpt.com）"
 echo "✅ 本地重试代理服务已停止并停用（运行 cx_proxy 可恢复）"

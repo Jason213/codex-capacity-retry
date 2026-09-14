@@ -58,9 +58,14 @@ tail -5 ~/.codex/capacity-retry-proxy/proxy.log
 | 命令 | 作用 |
 | --- | --- |
 | <code>cx_proxy</code> | 启用服务，让新启动的 Codex 会话经过重试代理。 |
-| <code>cx_office</code> | 移除自定义 provider，停止并停用服务，恢复原生直连。 |
+| <code>cx_office</code> | 保留同一个 provider 身份，将地址改为 ChatGPT 直连，并停止、停用重试服务。 |
 
-切换只对新启动的 Codex 会话生效。
+两个命令都会保留 <code>model_provider = "openai-proxy"</code>，只切换
+<code>[model_providers.openai-proxy].base_url</code>。这是为了保持会话恢复所需的 provider ID；
+如果切换到内置 <code>openai</code>，Codex 的名称恢复、<code>--last</code> 和会话选择器会过滤掉原来的
+<code>openai-proxy</code> 会话。当前 provider 还会显式设置 <code>supports_websockets = false</code>，因为本代理目前只处理 HTTP/SSE。
+
+切换只对新启动的 Codex 会话生效，切换后请重启正在运行的 Codex 进程。
 
 ## 配置
 
@@ -98,7 +103,7 @@ cp proxy.mjs ~/.codex/capacity-retry-proxy/
 PORT=8317 node ~/.codex/capacity-retry-proxy/proxy.mjs
 ~~~
 
-可参考 <code>bin/cx_proxy</code> 生成的 provider 配置修改 <code>~/.codex/config.toml</code>，再交给 <code>systemd</code> 或其他进程管理器托管。
+可参考 <code>bin/cx_proxy</code> 生成的 provider 配置修改 <code>~/.codex/config.toml</code>，再交给 <code>systemd</code> 或其他进程管理器托管。切换模式时保留 provider ID，只修改它的 <code>base_url</code>。
 
 ## 卸载
 
