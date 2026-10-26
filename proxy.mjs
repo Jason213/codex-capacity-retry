@@ -139,10 +139,15 @@ async function forwardOnce(req, body) {
   });
 }
 
+const DECODED_HEADERS = new Set(["content-encoding"]);
+
 function collectHeaders(upstream) {
   const headers = {};
   upstream.headers.forEach((v, k) => {
-    if (!HOP_HEADERS.has(k)) headers[k] = v;
+    // Node's fetch transparently decompresses gzip/br responses. Do not pass
+    // the stale encoding header to Codex, or it will try to decompress the
+    // already-decoded body and report a 502 (e.g. "incorrect header check").
+    if (!HOP_HEADERS.has(k) && !DECODED_HEADERS.has(k)) headers[k] = v;
   });
   return headers;
 }
