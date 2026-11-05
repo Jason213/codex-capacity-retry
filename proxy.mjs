@@ -210,7 +210,6 @@ async function relayWithSniff(req, res, upstream, canRetry, tag) {
   const sniff = req.method === "POST" || contentType.includes("event-stream");
 
   const rlog = (...a) => log(`[${tag}]`, ...a);
-  const reader = upstream.body.getReader();
   let pending = Buffer.alloc(0); // received bytes, events before `cursor` are handled
   let cursor = 0;
   let sentHead = false;
@@ -237,6 +236,8 @@ async function relayWithSniff(req, res, upstream, canRetry, tag) {
       res.end(output);
       return "DONE";
     }
+
+    const reader = upstream.body.getReader();
 
     if (!sniff) {
       // Non-SSE traffic: straight through, chunk by chunk.
