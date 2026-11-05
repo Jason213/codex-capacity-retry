@@ -24,6 +24,7 @@ const PORT = Number(process.env.PORT || 8317);
 const UPSTREAM = process.env.UPSTREAM || "https://chatgpt.com";
 const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 20); // ~8+ min of retrying at most
 const BASE_DELAY_MS = Number(process.env.BASE_DELAY_MS || 3000);
+const MODEL_CONTEXT_WINDOW = Number(process.env.MODEL_CONTEXT_WINDOW || 0);
 const HEAD_LIMIT = 1048576; // flush-through threshold while holding the stream head
 
 const UPSTREAM_URL = new URL(UPSTREAM);
@@ -152,6 +153,18 @@ function collectHeaders(upstream) {
   return headers;
 }
 
+function overrideModelContextWindow(payload) {
+  if (!MODEL_CONTEXT_WINDOW || !Array.isArray(payload?.models)) return payload;
+  return {
+    ...payload,
+    models: payload.models.map((model) => ({
+      ...model,
+      context_window: MODEL_CONTEXT_WINDOW,
+      max_context_window: MODEL_CONTEXT_WINDOW,
+    })),
+  };
+}
+
 // Classify one complete SSE event block for head-holding:
 //  "retry"  = terminal error event with a retryable code
 //  "meta"   = structural events with no user-visible output yet; safe to hold
@@ -210,6 +223,21 @@ async function relayWithSniff(req, res, upstream, canRetry, tag) {
   };
 
   try {
+    const requestPath = new URL(req.url, "http://127.0.0.1").pathname;
+    if (MODEL_CONTEXT_WINDOW && req.method === "GET" && requestPath === "/backend-api/codex/models") {
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      let output = buf;
+      try {
+        output = Buffer.from(JSON.stringify(overrideModelContextWindow(JSON.parse(buf.toString("utf8")))));
+        rlog(`${req.method} ${req.url} -> ${upstream.status} (context_window=${MODEL_CONTEXT_WINDOW})`);
+      } catch {
+        rlog(`${req.method} ${req.url} -> ${upstream.status} (context override skipped: invalid JSON)`);
+      }
+      res.writeHead(upstream.status, headers);
+      res.end(output);
+      return "DONE";
+    }
+
     if (!sniff) {
       // Non-SSE traffic: straight through, chunk by chunk.
       sendHead();
